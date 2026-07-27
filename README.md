@@ -1,51 +1,51 @@
 # Cursor 9Router Automation
 
-Bộ script macOS tự động bật/tắt 9Router, tạo public tunnel và cập nhật URL mới vào Cursor.
+macOS scripts that turn 9Router on or off, create a public tunnel, and update the new URL in Cursor automatically.
 
 ## Why
 
-Khi không có server để host 9Router cố định, bạn phải chạy 9Router trên máy local. Tuy nhiên, Cursor không cho đặt một URL HTTP local làm OpenAI Base URL nên cần sử dụng public tunnel.
+If you do not have a server to host 9Router permanently, you need to run 9Router on your local machine. However, Cursor does not allow a local HTTP URL to be used directly as the OpenAI Base URL, so a public tunnel is required.
 
-Mỗi lần bật 9Router, tunnel có thể tạo URL mới. Việc sao chép URL rồi cập nhật lại cấu hình Cursor bằng tay hằng ngày gây mất thời gian và dễ sai sót.
+Each time 9Router starts, the tunnel may generate a new URL. Copying that URL and manually updating Cursor every day is slow and error-prone.
 
 ## Solves This
 
-Bộ script tự động hóa toàn bộ quy trình:
+These scripts automate the whole flow:
 
-- Bật hoặc tắt 9Router bằng một lệnh.
-- Tạo public tunnel và lấy URL mới.
-- Thêm hậu tố `/v1` vào endpoint.
-- Tự động cập nhật `openAIBaseUrl` trong Cursor.
-- Khởi động lại Cursor để áp dụng cấu hình.
+- Turn 9Router on or off with one command.
+- Create a public tunnel and read the latest URL.
+- Append `/v1` to the endpoint.
+- Automatically update `openAIBaseUrl` in Cursor.
+- Restart Cursor so the new configuration is applied.
 
 ## How It Works
 
 ### `router-cursor-on`
 
-1. Kiểm tra các dependency và database cấu hình của Cursor.
-2. Khởi động 9Router tại `127.0.0.1:20128`.
-3. Bật Quick Tunnel do 9Router quản lý và đọc public URL.
-4. Đóng Cursor an toàn và sao lưu database cấu hình.
-5. Cập nhật `openAIBaseUrl` với URL tunnel có hậu tố `/v1`.
-6. Mở lại Cursor sau khi cập nhật thành công.
+1. Checks required dependencies and Cursor's configuration database.
+2. Starts 9Router at `127.0.0.1:20128`.
+3. Enables the Quick Tunnel managed by 9Router and reads the public URL.
+4. Closes Cursor safely and backs up the configuration database.
+5. Updates `openAIBaseUrl` with the tunnel URL plus the `/v1` suffix.
+6. Opens Cursor again after the update succeeds.
 
-Nếu cập nhật database thất bại, script sẽ tự khôi phục bản sao lưu cùng các file SQLite WAL/SHM liên quan.
+If the database update fails, the script restores the backup together with the related SQLite WAL/SHM files.
 
 ### `router-cursor-off`
 
-1. Tìm 9Router, listener trên cổng `20128` và tunnel liên quan.
-2. Gửi `SIGTERM` để các tiến trình dừng an toàn.
-3. Chỉ dùng `SIGKILL` nếu tiến trình không phản hồi sau thời gian chờ.
+1. Finds 9Router, the listener on port `20128`, and the related tunnel process.
+2. Sends `SIGTERM` so the processes can stop safely.
+3. Uses `SIGKILL` only if a process does not respond after the timeout.
 
-## Yêu cầu
+## Requirements
 
 - macOS.
-- Cursor đã được cài đặt và từng khởi chạy.
-- 9Router CLI có trong `PATH`.
-- Các tiện ích hệ thống: `zsh`, `python3`, `pgrep`, `lsof`, `ps`, `sort`, `tr`, `osascript` và `open`.
-- 9Router đã có thông tin tunnel cục bộ trong thư mục `~/.9router`.
+- Cursor installed and launched at least once.
+- 9Router CLI available in `PATH`.
+- System utilities: `zsh`, `python3`, `pgrep`, `lsof`, `ps`, `sort`, `tr`, `osascript`, and `open`.
+- 9Router local tunnel data available under `~/.9router`.
 
-Kiểm tra 9Router:
+Check 9Router:
 
 ```zsh
 command -v 9router
@@ -53,36 +53,36 @@ command -v 9router
 
 ## Quick Start
 
-Cấp quyền thực thi ở lần đầu:
+Grant execute permission the first time:
 
 ```zsh
 chmod +x router-cursor-on router-cursor-off
 ```
 
-Khởi động 9Router, bật tunnel và cấu hình Cursor:
+Start 9Router, enable the tunnel, and configure Cursor:
 
 ```zsh
 ./router-cursor-on
 ```
 
-Dừng 9Router và tunnel:
+Stop 9Router and the tunnel:
 
 ```zsh
 ./router-cursor-off
 ```
 
-> `router-cursor-on` có thể tự đóng rồi mở lại Cursor. Hãy lưu công việc đang chỉnh sửa trước khi chạy.
+> `router-cursor-on` may close and reopen Cursor. Save any work in progress before running it.
 
-## File và dữ liệu liên quan
+## Related Files and Data
 
-- Log 9Router: `~/.9router.log`
-- Trạng thái tunnel: `~/.9router/tunnel/state.json`
-- Database Cursor:
+- 9Router log: `~/.9router.log`
+- Tunnel state: `~/.9router/tunnel/state.json`
+- Cursor database:
   `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
-- Bản sao lưu gần nhất: `~/.cursor-state.vscdb.backup`
+- Latest backup: `~/.cursor-state.vscdb.backup`
 
-## Giới hạn
+## Limitations
 
-- Script hiện dành riêng cho macOS.
-- Cổng `20128` đang được cấu hình cố định trong cả hai script.
-- Cách lưu cấu hình nội bộ của Cursor có thể thay đổi sau một bản cập nhật. Nên kiểm tra lại script nếu Cursor không nhận Base URL.
+- These scripts are currently macOS-only.
+- Port `20128` is hard-coded in both scripts.
+- Cursor's internal settings storage may change after an update. Recheck the script if Cursor no longer picks up the Base URL.
