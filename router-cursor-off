@@ -1,0 +1,62 @@
+#!/bin/zsh
+# Dừng ngay khi lệnh lỗi (-e), dùng biến chưa khai báo (-u), hoặc pipeline lỗi (pipefail).
+set -euo pipefail
+
+# Cổng local cố định mà 9Router lắng nghe.
+LOCAL_PORT='20128'
+
+get_target_pids() {
+  {
+    # Tìm tiến trình 9Router được khởi chạy rõ ràng với cổng 20128.
+    # Mẫu [9]router tránh để pgrep tự khớp chính câu lệnh tìm kiếm.
+    pgrep -f '[9]router.*--port[ =]20128' || true
+    # Tìm tiến trình bất kỳ đang LISTEN trên cổng local của router.
+    lsof -tiTCP:"$LOCAL_PORT" -sTCP:LISTEN || true
+    # Tìm Cloudflared do 9Router quản lý và đang forward đúng cổng 20128.
+    pgrep -f '[.]9router/bin/cloudflared.*--url http://127.0.0.1:20128' || true
+    # Gộp, sắp xếp và loại PID trùng nhau từ ba nguồn trên.
+  } | sort -un
+}
+
+stop_targets() {
+  local signal="$1"
+  local pids
+  pids="$(get_target_pids)"
+  # Không có PID thì coi như đã dừng thành công.
+  [[ -z "$pids" ]] && return 0
+  # ${(f)pids} tách chuỗi nhiều dòng thành mảng theo từng dòng trong zsh.
+  kill "-$signal" ${(f)pids} 2>/dev/null || true
+}
+
+# Kiểm tra sớm các tiện ích hệ thống cần dùng.
+for cmd in pgrep lsof sort kill; do
+  command -v "$cmd" >/dev/null 2>&1 || { print -u2 "Missing required command: $cmd"; exit 1; }
+done
+
+# Thoát nhẹ nhàng nếu router và tunnel vốn không chạy.
+pids="$(get_target_pids)"
+if [[ -z "$pids" ]]; then
+  print '9Router and its managed tunnel are not running.'
+  exit 0
+fi
+
+print "Stopping 9Router, its listener, and its managed tunnel: ${(j: :)${(f)pids}}"
+# Gửi SIGTERM trước để tiến trình có cơ hội shutdown sạch.
+stop_targets TERM
+# Chờ tối đa 10 giây, kiểm tra lại mỗi giây.
+for _ in {1..10}; do
+  [[ -z "$(get_target_pids)" ]] && { print '9Router and its managed tunnel stopped.'; exit 0; }
+  sleep 1
+done
+
+# Chỉ dùng SIGKILL với những tiến trình không phản hồi SIGTERM.
+pids="$(get_target_pids)"
+print "Force-stopping remaining 9Router processes: ${(j: :)${(f)pids}}"
+stop_targets KILL
+sleep 1
+# Xác nhận lần cuối để không báo thành công sai.
+if [[ -n "$(get_target_pids)" ]]; then
+  print -u2 'Some 9Router processes could not be stopped.'
+  exit 1
+fi
+print '9Router and its managed tunnel stopped.'

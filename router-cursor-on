@@ -1,0 +1,262 @@
+#!/bin/zsh
+# Dừng ngay khi lệnh lỗi (-e), dùng biến chưa khai báo (-u), hoặc pipeline lỗi (pipefail).
+set -euo pipefail
+
+# Cổng local của 9Router và endpoint được tạo từ cổng này để tránh khai báo trùng.
+LOCAL_PORT='20128'
+LOCAL_URL="http://127.0.0.1:${LOCAL_PORT}"
+# File log của tiến trình 9Router chạy nền.
+ROUTER_LOG="$HOME/.9router.log"
+# State do 9Router ghi, dùng để suy ra URL public của Quick Tunnel.
+TUNNEL_STATE_FILE="$HOME/.9router/tunnel/state.json"
+# SQLite lưu application-level settings của Cursor và bản backup trước khi sửa.
+DB_PATH="$HOME/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+DB_BACKUP="$HOME/.cursor-state.vscdb.backup"
+# Key chứa JSON settings cần cập nhật openAIBaseUrl.
+STORAGE_KEY='src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser'
+# Ghi nhận backup có sidecar SQLite hay không để rollback đúng trạng thái ban đầu.
+BACKUP_HAS_WAL=0
+BACKUP_HAS_SHM=0
+
+require_command() {
+  # command -v chỉ kiểm tra sự tồn tại, không chạy command.
+  if ! command -v "$1" >/dev/null 2>&1; then
+    print -u2 "Missing required command: $1"
+    exit 1
+  fi
+}
+
+router_is_listening() {
+  local router_pids listener_pids router_pid listener_pid parent_pid
+  router_pids="$(pgrep -f "[9]router.*--port[ =]${LOCAL_PORT}" || true)"
+  listener_pids="$(lsof -tiTCP:"$LOCAL_PORT" -sTCP:LISTEN || true)"
+
+  # 9Router CLI sinh một process con next-server để LISTEN, nên hai PID khác nhau.
+  # Chỉ thành công khi listener là process con trực tiếp của đúng 9Router instance.
+  for listener_pid in ${(f)listener_pids}; do
+    parent_pid="$(ps -o ppid= -p "$listener_pid" | tr -d '[:space:]')"
+    for router_pid in ${(f)router_pids}; do
+      [[ "$parent_pid" == "$router_pid" ]] && return 0
+    done
+  done
+  return 1
+}
+
+restore_backup() {
+  # Khôi phục cả database chính và các sidecar WAL/SHM nếu cập nhật thất bại.
+  print -u2 'SQLite update failed; restoring Cursor database backup.'
+  cp -f "$DB_BACKUP" "$DB_PATH"
+  if [[ "$BACKUP_HAS_WAL" -eq 1 ]]; then
+    cp -f "$DB_BACKUP-wal" "$DB_PATH-wal"
+  else
+    rm -f "$DB_PATH-wal"
+  fi
+  if [[ "$BACKUP_HAS_SHM" -eq 1 ]]; then
+    cp -f "$DB_BACKUP-shm" "$DB_PATH-shm"
+  else
+    rm -f "$DB_PATH-shm"
+  fi
+}
+
+read_public_url() {
+  # Truyền path qua environment để heredoc Python không cần nội suy shell.
+  TUNNEL_STATE_FILE="$TUNNEL_STATE_FILE" python3 <<'PY'
+import json
+import os
+import re
+from pathlib import Path
+
+path = Path(os.environ['TUNNEL_STATE_FILE'])
+try:
+    state = json.loads(path.read_text(encoding='utf-8'))
+except (FileNotFoundError, json.JSONDecodeError, OSError):
+    state = {}
+
+short_id = state.get('shortId', '')
+tunnel_url = state.get('tunnelUrl', '')
+
+# 9Router's public endpoint is derived from its short ID.  The raw
+# trycloudflare.com URL is only the underlying Quick Tunnel transport.
+if isinstance(short_id, str) and re.fullmatch(r'[a-z0-9]+', short_id):
+    print(f'https://r{short_id}.abc-tunnel.us')
+elif isinstance(tunnel_url, str) and tunnel_url.startswith('https://') and tunnel_url.endswith('.trycloudflare.com'):
+    print(tunnel_url)
+PY
+}
+
+enable_9router_tunnel() {
+  # Dùng cùng cơ chế xác thực nội bộ với 9Router CLI. Secret chỉ tồn tại trong
+  # process Python và tuyệt đối không được in hay đưa vào command-line curl.
+  LOCAL_URL="$LOCAL_URL" python3 <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+home = Path.home()
+try:
+    machine_id = (home / '.9router' / 'machine-id').read_text(encoding='utf-8').strip()
+    secret = (home / '.9router' / 'auth' / 'cli-secret').read_text(encoding='utf-8').strip()
+except OSError as exc:
+    raise SystemExit(f'Cannot read 9Router local tunnel credentials: {exc}')
+
+if not machine_id or not secret:
+    raise SystemExit('9Router local tunnel credentials are empty')
+
+token = hashlib.sha256(f'{machine_id}9r-cli-auth{secret}'.encode()).hexdigest()[:16]
+request = Request(
+    os.environ['LOCAL_URL'] + '/api/tunnel/enable',
+    data=b'',
+    method='POST',
+    headers={'Content-Type': 'application/json', 'x-9r-cli-token': token},
+)
+try:
+    with urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode('utf-8') or '{}')
+except TimeoutError:
+    # 9Router can keep this request open while cloudflared is starting. The
+    # request was sent, so continue with the process/state polling below.
+    payload = {}
+except (HTTPError, URLError, OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f'9Router tunnel enable request failed: {exc}')
+
+if isinstance(payload, dict) and payload.get('error'):
+    raise SystemExit(f"9Router tunnel enable request failed: {payload['error']}")
+PY
+}
+
+# Fail fast nếu thiếu dependency hoặc chưa có database của Cursor.
+for cmd in 9router python3 lsof pgrep ps tr osascript open; do require_command "$cmd"; done
+[[ -f "$DB_PATH" ]] || { print -u2 "Cursor database not found: $DB_PATH"; exit 1; }
+
+# Chỉ tái sử dụng process khi chính 9Router với --port tương ứng đang giữ cổng.
+if router_is_listening; then
+  print "9Router is already listening on port $LOCAL_PORT; skipping start."
+else
+  # Không khởi động nếu ứng dụng khác đang chiếm cổng, tránh báo nhầm là 9Router.
+  if lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    print -u2 "Port $LOCAL_PORT is already occupied by a process other than the expected 9Router instance."
+    exit 1
+  fi
+  print "Starting 9Router at $LOCAL_URL"
+  # nohup giữ router chạy sau khi terminal đóng; toàn bộ stdout/stderr đi vào log.
+  nohup 9router --tray --skip-update --no-browser --port "$LOCAL_PORT" --host 127.0.0.1 >> "$ROUTER_LOG" 2>&1 &
+fi
+
+# 9Router có thể cần lâu hơn để spawn next-server sau khi vừa shutdown sạch.
+for _ in {1..60}; do
+  router_is_listening && break
+  sleep 1
+done
+if ! router_is_listening; then
+  print -u2 "9Router did not start within 60 seconds. Check log: $ROUTER_LOG"
+  exit 1
+fi
+
+print 'Enabling the tunnel managed by 9Router...'
+if ! enable_9router_tunnel; then
+  print -u2 '9Router accepted no tunnel enable request; database was not modified.'
+  exit 1
+fi
+print 'Waiting for the tunnel managed by 9Router...'
+PUBLIC_URL=''
+# Chờ tối đa 40 giây để cloudflared chạy và state chứa URL hợp lệ.
+for _ in {1..40}; do
+  if pgrep -f '[.]9router/bin/cloudflared.*tunnel' >/dev/null 2>&1; then
+    PUBLIC_URL="$(read_public_url)"
+    [[ -n "$PUBLIC_URL" ]] && break
+  fi
+  sleep 1
+done
+if [[ -z "$PUBLIC_URL" ]]; then
+  print -u2 '9Router tunnel is not available after 40 seconds.'
+  print -u2 'Open 9Router and enable its Cloudflare/Quick Tunnel toggle, then run this command again.'
+  print -u2 "9Router log: $ROUTER_LOG"
+  exit 1
+fi
+
+# Cursor cần OpenAI-compatible base URL kết thúc bằng /v1.
+PUBLIC_BASE_URL="${PUBLIC_URL}/v1"
+print "9Router Quick Tunnel URL: $PUBLIC_URL"
+print "Cursor OpenAI Base URL:   $PUBLIC_BASE_URL"
+
+# Phải đóng Cursor trước khi sửa SQLite để tránh lock hoặc ghi đè state đang mở.
+if pgrep -x Cursor >/dev/null 2>&1; then
+  print 'Cursor is running; requesting a graceful quit...'
+  # Yêu cầu macOS đóng ứng dụng bình thường để Cursor tự flush dữ liệu.
+  if ! quit_error="$(osascript -e 'tell application "Cursor" to quit' 2>&1)"; then
+    print -u2 "Could not send the Cursor quit request: $quit_error"
+  fi
+  for _ in {1..30}; do
+    pgrep -x Cursor >/dev/null 2>&1 || break
+    sleep 1
+  done
+  if pgrep -x Cursor >/dev/null 2>&1; then
+    print -u2 'Cursor is still running and holds its database; database was not modified.'
+    print -u2 'Save your work, quit Cursor with Cmd+Q, then run router-cursor-on again.'
+    exit 1
+  fi
+  print 'Cursor closed.'
+else
+  print 'Cursor is not running; safe to update its database.'
+fi
+
+print 'Backing up Cursor state database...'
+# Backup database và các sidecar hiện có trước mọi thay đổi.
+cp -f "$DB_PATH" "$DB_BACKUP"
+if [[ -f "$DB_PATH-wal" ]]; then
+  cp -f "$DB_PATH-wal" "$DB_BACKUP-wal"
+  BACKUP_HAS_WAL=1
+fi
+if [[ -f "$DB_PATH-shm" ]]; then
+  cp -f "$DB_PATH-shm" "$DB_BACKUP-shm"
+  BACKUP_HAS_SHM=1
+fi
+
+# Đọc JSON settings, chỉ thay openAIBaseUrl, commit và đọc lại để xác minh.
+# Các giá trị được truyền bằng environment và query SQLite dùng parameter binding.
+if ! DB_PATH="$DB_PATH" STORAGE_KEY="$STORAGE_KEY" PUBLIC_BASE_URL="$PUBLIC_BASE_URL" python3 <<'PY'
+import json
+import os
+import sqlite3
+
+db_path = os.environ['DB_PATH']
+storage_key = os.environ['STORAGE_KEY']
+base_url = os.environ['PUBLIC_BASE_URL']
+
+conn = sqlite3.connect(db_path, timeout=10)
+try:
+    row = conn.execute('SELECT value FROM ItemTable WHERE key = ?', (storage_key,)).fetchone()
+    if row is None:
+        raise RuntimeError(f'Storage key not found: {storage_key}')
+    payload = json.loads(row[0])
+    if not isinstance(payload, dict):
+        raise RuntimeError('Storage value is not a JSON object')
+    payload['openAIBaseUrl'] = base_url
+    result = conn.execute('UPDATE ItemTable SET value = ? WHERE key = ?', (json.dumps(payload, separators=(",", ":")), storage_key))
+    if result.rowcount != 1:
+        raise RuntimeError(f'Expected one row to update, updated {result.rowcount}')
+    conn.commit()
+    verified = conn.execute('SELECT value FROM ItemTable WHERE key = ?', (storage_key,)).fetchone()
+    verified_payload = json.loads(verified[0]) if verified else None
+    if not isinstance(verified_payload, dict) or verified_payload.get('openAIBaseUrl') != base_url:
+        raise RuntimeError('Post-update verification failed')
+finally:
+    conn.close()
+PY
+then
+  # Bất kỳ lỗi Python/SQLite/xác minh nào cũng phục hồi backup rồi thoát.
+  restore_backup
+  exit 1
+fi
+
+# Mở lại Cursor sau khi database đã được cập nhật và xác minh thành công.
+open -a Cursor
+print ''
+print 'Cursor configured successfully.'
+print "Local URL:       $LOCAL_URL"
+print "Public Base URL: $PUBLIC_BASE_URL"
+print "9Router log:     $ROUTER_LOG"
+print "Tunnel state:    $TUNNEL_STATE_FILE"
