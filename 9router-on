@@ -195,7 +195,7 @@ if pgrep -x Cursor >/dev/null 2>&1; then
   done
   if pgrep -x Cursor >/dev/null 2>&1; then
     print -u2 'Cursor is still running and holds its database; database was not modified.'
-    print -u2 'Save your work, quit Cursor with Cmd+Q, then run router-cursor-on again.'
+    print -u2 'Save your work, quit Cursor with Cmd+Q, then run 9router-on again.'
     exit 1
   fi
   print 'Cursor closed.'
