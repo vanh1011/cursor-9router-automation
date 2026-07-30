@@ -112,15 +112,32 @@ request = Request(
     method='POST',
     headers={'Content-Type': 'application/json', 'x-9r-cli-token': token},
 )
+def is_timeout(exc):
+    # urllib may raise TimeoutError, socket.timeout, or URLError("timed out").
+    if isinstance(exc, TimeoutError):
+        return True
+    reason = getattr(exc, 'reason', None)
+    for candidate in (exc, reason):
+        if candidate is None:
+            continue
+        if isinstance(candidate, TimeoutError):
+            return True
+        if 'timed out' in str(candidate).lower() or 'timeout' in str(candidate).lower():
+            return True
+    return False
+
 try:
-    with urlopen(request, timeout=15) as response:
+    # 9Router may keep this open while cloudflared starts; use a short timeout
+    # and treat timeout as success so the polling loop below can finish.
+    with urlopen(request, timeout=20) as response:
         payload = json.loads(response.read().decode('utf-8') or '{}')
-except TimeoutError:
-    # 9Router can keep this request open while cloudflared is starting. The
-    # request was sent, so continue with the process/state polling below.
-    payload = {}
-except (HTTPError, URLError, OSError, json.JSONDecodeError) as exc:
-    raise SystemExit(f'9Router tunnel enable request failed: {exc}')
+except Exception as exc:
+    if is_timeout(exc):
+        payload = {}
+    elif isinstance(exc, (HTTPError, URLError, OSError, json.JSONDecodeError)):
+        raise SystemExit(f'9Router tunnel enable request failed: {exc}')
+    else:
+        raise
 
 if isinstance(payload, dict) and payload.get('error'):
     raise SystemExit(f"9Router tunnel enable request failed: {payload['error']}")
